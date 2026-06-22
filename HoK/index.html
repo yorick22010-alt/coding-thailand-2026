@@ -1,89 +1,499 @@
-# Smart Parking & Obstacle Monitor - Python side
-# Python side: WebUI + REST API + RouterBridge to the MCU.
-#
-# Data flow:
-# Browser Webcam -> Detection -> /api/status?data=warning
-# -> Python receives status -> Bridge.call("set_status", status)
-# -> Arduino C/C++ sketch updates the LED matrix.
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ระบบแจ้งเตือนวัตถุกีดขวางและรถจอดขวาง (AI อัตโนมัติ)</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
 
-from arduino.app_utils import App, Bridge
-from arduino.app_bricks.web_ui import WebUI
-from fastapi import Request
-import os
-import time
+    <style>
+        * {
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
 
-# ค้นหาตำแหน่งโฟลเดอร์ assets เพื่อดึงไฟล์ index.html ขึ้นมาแสดงผล
-APP_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-ASSETS_DIR = os.path.join(APP_DIR, "assets")
-ui = WebUI(assets_dir_path=ASSETS_DIR)
+        body {
+            background-color: #121212;
+            color: #ffffff;
+            padding: 20px;
+        }
 
-# กำหนดสถานะความปลอดภัยที่ระบบยอมรับ
-VALID_STATUSES = {
-    "normal",   # ปลอดภัย/ปกติ
-    "warning",  # เริ่มเตือนภัย (ตรวจเจอวัตถุ/รถ)
-    "danger",   # อันตรายร้ายแรง (จอดแช่เกินเวลา)
-}
+        .container {
+            max-width: 1300px;
+            margin: 0 auto;
+        }
 
-latest_state = {
-    "status": "normal",
-    "updated_at": time.time(),
-    "bridge_ok": False,
-    "bridge_result": None,
-    "error": None,
-}
+        header {
+            text-align: center;
+            margin-bottom: 25px;
+            border-bottom: 2px solid #333;
+            padding-bottom: 15px;
+        }
 
-def send_status_to_mcu(status_string: str):
-    """เรียกใช้งานฟังก์ชัน set_status ที่ถูกเขียนไว้บนฝั่งบอร์ด Arduino"""
-    try:
-        # สั่งยิงข้อมูลข้ามฝั่งผ่านระบบ RouterBridge 
-        result = Bridge.call("set_status", status_string)
-        return True, str(result), None
-    except Exception as exc:
-        print(f"[Bridge] ไม่สามารถส่งสถานะไปที่บอร์ดได้: {exc}")
-        return False, None, str(exc)
+        h1 {
+            color: #ff4d4d;
+        }
 
-def api_status_info():
-    """ส่งคืนสถานะล่าสุดของระบบ"""
-    return latest_state
+        .main-content {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 25px;
+        }
 
-def api_status_update(request: Request):
-    """
-    GET API endpoint สำหรับรับข้อมูลสถานะความปลอดภัยจากหน้าเว็บ
-    ตัวอย่างการเรียกใช้งานจาก JavaScript:
-       /api/status?data=warning
-       /api/status?data=danger
-    """
-    raw_status = request.query_params.get("data", "normal").strip().lower()
+        /* ส่วนแสดงผลกล้องและ Canvas */
+        .video-section {
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            position: relative;
+        }
 
-    # ตรวจสอบความถูกต้องของสถานะ
-    status = raw_status if raw_status in VALID_STATUSES else "normal"
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            max-height: 480px;
+            background-color: #000;
+            border-radius: 8px;
+            border: 2px solid #3a3a3a;
+            overflow: hidden;
+        }
 
-    # ส่งสถานะข้ามไปสั่งงานหน้าตาไฟ LED Matrix บนบอร์ด Arduino
-    bridge_ok, bridge_result, error = send_status_to_mcu(status)
+        video {
+            width: 100%;
+            height: auto;
+            display: block;
+            transform: scaleX(-1); /* กลับด้านกล้อง Mirror */
+        }
 
-    # บันทึกสถานะลงในระบบตัวกลาง
-    latest_state["status"] = status
-    latest_state["updated_at"] = time.time()
-    latest_state["bridge_ok"] = bridge_ok
-    latest_state["bridge_result"] = bridge_result
-    latest_state["error"] = error
+        /* Canvas ซ้อนทับบนวิดีโอเพื่อวาดกล่อง Bounding Box */
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            transform: scaleX(-1); /* กลับด้านตามวิดีโอ */
+        }
 
-    print(f"[Security Status] ปรับเปลี่ยนเป็นสถานะ: {status}, สั่งงานบอร์ดสำเร็จหรือไม่={bridge_ok}")
+        .ai-status {
+            margin-top: 15px;
+            padding: 10px;
+            background: #2b2b2b;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            color: #00ffcc;
+            text-align: center;
+        }
 
-    return {
-        "ok": bridge_ok,
-        "status": status,
-        "bridge_ok": bridge_ok,
-        "bridge_result": bridge_result,
-        "error": error,
+        /* ส่วนควบคุมและสถานะการจับเวลา */
+        .status-section {
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+
+        .status-box {
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 1.3rem;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }
+
+        .status-clear { background-color: #2e7d32; color: #fff; }
+        .status-warning { background-color: #f9a825; color: #000; animation: blink 1s infinite; }
+        .status-danger { background-color: #c62828; color: #fff; animation: blink 0.5s infinite; }
+        .status-acknowledged { background-color: #0288d1; color: #fff; }
+
+        @keyframes blink {
+            50% { opacity: 0.6; }
+        }
+
+        .timer-container {
+            background-color: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+
+        .timer-display {
+            font-size: 3.5rem;
+            font-family: 'Courier New', Courier, monospace;
+            color: #00ffcc;
+            font-weight: bold;
+        }
+
+        .log-container {
+            background-color: #000;
+            padding: 12px;
+            border-radius: 6px;
+            height: 180px;
+            overflow-y: auto;
+            font-size: 0.85rem;
+            border: 1px solid #333;
+        }
+
+        .log-entry {
+            margin-bottom: 6px;
+            border-left: 4px solid #00ffcc;
+            padding-left: 8px;
+            line-height: 1.4;
+        }
+
+        button {
+            padding: 14px;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        
+        .action-buttons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .btn-ack { background-color: #0288d1; }
+        .btn-ack:hover { background-color: #01579b; }
+        .btn-reset { background-color: #546e7a; }
+        .btn-reset:hover { background-color: #37474f; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>Smart Parking & Obstacle Monitor (AI Auto)</h1>
+        <p>ระบบตรวจจับการจอดขวางและสิ่งของกีดขวางอัตโนมัติด้วย AI Object Detection (COCO-SSD)</p>
+    </header>
+
+    <div class="main-content">
+        <div class="video-section">
+            <h3>🔴 สัญญาณสดพร้อมระบบวิเคราะห์ AI</h3>
+            <div class="video-wrapper">
+                <video id="webcam" autoplay playsinline muted></video>
+                <canvas id="canvas"></canvas>
+            </div>
+            <p id="camera-error" style="color: #ff4d4d; margin-top: 5px; display: none;"></p>
+            <div class="ai-status" id="ai-loading-status">🤖 กำลังโหลดโมเดล AI... กรุณารอสักครู่</div>
+        </div>
+
+        <div class="status-section">
+            <div>
+                <h3>📊 สถานะพื้นที่ตรวจจับ</h3>
+                <div id="status-banner" class="status-clear">สถานะ: ปกติ - ไม่มีสิ่งกีดขวาง</div>
+                
+                <div class="timer-container">
+                    <p style="color: #aaa; font-size: 0.9rem;" id="timer-title">เวลาที่เริ่มตรวจจับ</p>
+                    <div class="timer-display" id="timer">00:00</div>
+                </div>
+            </div>
+
+            <div>
+                <h3>📝 บันทึกระบบ & การควบคุม</h3>
+                <div class="log-container" id="log-box">
+                    <div class="log-entry" style="border-left-color: #2e7d32;">[ระบบ] เริ่มต้นระบบและพร้อมเชื่อมต่อกล้อง...</div>
+                </div>
+                
+                <div class="action-buttons">
+                    <button class="btn-ack" onclick="acknowledgeAlert()">✅ รับทราบ (ปิดเสียงเตือน)</button>
+                    <button class="btn-reset" onclick="resetSystem()">🔄 รีเซ็ตระบบใหม่</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const cameraError = document.getElementById('camera-error');
+    const timerDisplay = document.getElementById('timer');
+    const timerTitle = document.getElementById('timer-title');
+    const statusBanner = document.getElementById('status-banner');
+    const logBox = document.getElementById('log-box');
+    const aiLoadingStatus = document.getElementById('ai-loading-status');
+
+    let model = null;
+    let timerInterval;
+    let voiceInterval;
+    let secondsElapsed = 0;
+    
+    let currentType = "";         // "vehicle", "obstacle" หรือ ""
+    let isAcknowledged = false;   // บันทึกว่าผู้ใช้กดรับทราบหรือยัง
+    let objectMissingCounter = 0; // ตัวนับวินาทีที่วัตถุหายไป (ช่วยลดปัญหากล้องกระพริบแล้วหลุดตรวจจับ)
+
+    // ตั้งเวลาหน่วงตรวจจับไว้ที่ 10 วินาที เพื่อการทดสอบ (ใช้งานจริงสามารถเปลี่ยนเป็น 60 หรือ 180 ได้ครับ)
+    const alertTimeoutSeconds = 10; 
+
+    // รายชื่อ Class วัตถุประเภทรถยนต์จากโมเดล COCO-SSD
+    const vehicleClasses = ['car', 'truck', 'motorcycle', 'bus'];
+    // รายชื่อ Class วัตถุประเภทสิ่งของกีดขวางทั่วไป (ปรับแต่งเพิ่ม/ลดได้ตามต้องการ)
+    const obstacleClasses = ['backpack', 'umbrella', 'bag', 'suitcase', 'chair', 'couch', 'potted plant', 'box', 'bench'];
+
+    // 1. เรียกเปิดกล้องเครื่องจริง และ โหลดโมเดล AI
+    async function initSystem() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+            video.srcObject = stream;
+            addLog("เชื่อมต่อกล้องสำเร็จ");
+            
+            if (Notification.permission !== "granted") {
+                Notification.requestPermission();
+            }
+
+            // เล่นวิดีโอแล้วอัปเดตขนาด Canvas
+            video.addEventListener('loadedmetadata', () => {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+            });
+
+            // โหลดโมเดล COCO-SSD
+            model = await cocoSsd.load();
+            aiLoadingStatus.innerText = "🤖 โมเดล AI พร้อมทำงาน! กำลังเริ่มตรวจจับแบบ Real-time...";
+            aiLoadingStatus.style.color = "#00ff00";
+            addLog("โมเดล AI (COCO-SSD) โหลดเสร็จสิ้น เริ่มการสแกนพื้นที่");
+
+            // เริ่มทำการ Loop ตรวจจับวัตถุ
+            detectFrame();
+
+        } catch (error) {
+            cameraError.style.display = "block";
+            cameraError.innerText = "⚠️ ไม่สามารถเปิดกล้อง หรือเกิดข้อผิดพลาดในการโหลด AI: " + error.message;
+            addLog("ระบบล้มเหลว: ไม่สามารถรันระบบตรวจจับได้");
+        }
     }
 
-# ลงทะเบียนช่องทาง API (Endpoints) ให้หน้าเว็บเรียกใช้งานได้
-ui.expose_api("GET", "/api/status/info", api_status_info)
-ui.expose_api("GET", "/api/status", api_status_update)
+    // เริ่มระบบเมื่อโหลดหน้าเว็บ
+    initSystem();
 
-# เริ่มต้นระบบให้บอร์ดขึ้นหน้าตาปกติก่อน
-send_status_to_mcu("normal")
+    // 2. ฟังก์ชันตรวจสอบเฟรมภาพจากวิดีโอ (วิ่งไปเรื่อยๆ แบบ Real-time)
+    async function detectFrame() {
+        if (model && video.readyState === video.HAVE_ENOUGH_DATA) {
+            const predictions = await model.detect(video);
+            
+            // วาดรูปกรอบครอบวัตถุลงบน Canvas
+            drawBoundingBoxes(predictions);
+            
+            // วิเคราะห์วัตถุที่เจอเพื่อนำไปควบคุมสถานะระบบ
+            analyzePredictions(predictions);
+        }
+        // เรียกซ้ำในเฟรมถัดไป
+        requestAnimationFrame(detectFrame);
+    }
 
-# รันระบบเฟรมเวิร์กของ App Lab
-App.run()
+    // 3. ฟังก์ชันวาดกรอบครอบวัตถุที่ตรวจเจอ
+    function drawBoundingBoxes(predictions) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        predictions.forEach(prediction => {
+            // กรองเอาเฉพาะวัตถุที่มีค่าความมั่นใจ (Confidence) เกิน 55%
+            if (prediction.score > 0.55) {
+                const [x, y, width, height] = prediction.bbox;
+                
+                // เลือกสีกล่องตามประเภทวัตถุ
+                if (vehicleClasses.includes(prediction.class)) {
+                    ctx.strokeStyle = '#ff4d4d';
+                    ctx.fillStyle = '#ff4d4d';
+                } else if (obstacleClasses.includes(prediction.class)) {
+                    ctx.strokeStyle = '#fb8c00';
+                    ctx.fillStyle = '#fb8c00';
+                } else {
+                    ctx.strokeStyle = '#00ffcc';
+                    ctx.fillStyle = '#00ffcc';
+                }
+
+                // วาดเส้นกรอบ
+                ctx.lineWidth = 3;
+                ctx.strokeRect(x, y, width, height);
+                
+                // วาดป้ายชื่อวัตถุ
+                ctx.font = '16px Segoe UI, Arial';
+                const text = `${prediction.class} (${Math.round(prediction.score * 100)}%)`;
+                const textWidth = ctx.measureText(text).width;
+                ctx.fillRect(x, y - 25, textWidth + 10, 25);
+                ctx.fillStyle = '#000000';
+                ctx.fillText(text, x + 5, y - 7);
+            }
+        });
+    }
+
+    // 4. ฟังก์ชันวิเคราะห์วัตถุและเริ่มกระบวนการนับเวลา (Core Logic)
+    function analyzePredictions(predictions) {
+        // หาวัตถุที่มีความมั่นใจสูง > 55%
+        const validPredictions = predictions.filter(p => p.score > 0.55);
+        
+        let foundVehicle = validPredictions.find(p => vehicleClasses.includes(p.class));
+        let foundObstacle = validPredictions.find(p => obstacleClasses.includes(p.class));
+
+        // เลือกพิจารณาประเภทใดประเภทหนึ่ง (ให้สิทธิ์รถยนต์ก่อน)
+        let detectedType = "";
+        if (foundVehicle) detectedType = "vehicle";
+        else if (foundObstacle) detectedType = "obstacle";
+
+        if (detectedType !== "") {
+            // รีเซ็ตตัวนับเมื่อวัตถุยังอยู่ปกติ
+            objectMissingCounter = 0;
+
+            // ถ้าระบบยังไม่มีการตรวจจับค้างอยู่ หรือ มีการกดรีเซ็ตไปแล้ว ให้เริ่มจับเวลาใหม่
+            if (currentType === "") {
+                startTracking(detectedType);
+            }
+        } else {
+            // หากในเฟรมนี้ไม่พบวัตถุเลย แต่ระบบกำลังจับเวลา/เตือนอยู่
+            if (currentType !== "") {
+                objectMissingCounter++;
+                // หน่วงเวลาไว้ประมาณ 60 เฟรม (หรือประมาณ 2 วินาที) เผื่อกรณี AI ตรวจจับหลุดเป็นบางเฟรมสั้นๆ
+                if (objectMissingCounter > 60) {
+                    // หากเจ้าของไม่ได้กดรับทราบค้างไว้ และวัตถุหายไปจริง ให้รีเซ็ตระบบกลับสู่ภาวะปกติอัตโนมัติ
+                    if (!isAcknowledged) {
+                        autoResetToClear();
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. ฟังก์ชันเริ่มนับเวลาเมื่อตรวจพบสิ่งกีดขวางนิ่ง
+    function startTracking(type) {
+        currentType = type;
+        isAcknowledged = false;
+        secondsElapsed = 0;
+
+        if (type === 'vehicle') {
+            statusBanner.className = "status-warning";
+            statusBanner.innerText = "เตือน: AI ตรวจพบยานพาหนะจอดขวาง";
+            timerTitle.innerText = "เวลาที่รถยนต์จอดนิ่ง";
+            addLog("AI อัตโนมัติ: ตรวจพบรถยนต์ในพื้นที่ (กำลังจับเวลาเฝ้าระวัง)");
+        } else if (type === 'obstacle') {
+            statusBanner.className = "status-warning";
+            statusBanner.innerText = "เตือน: AI ตรวจพบสิ่งของกีดขวางพื้นที่";
+            timerTitle.innerText = "เวลาที่สิ่งของวางกีดขวาง";
+            addLog("AI อัตโนมัติ: ตรวจพบสิ่งของถูกนำมาวาง (กำลังจับเวลาเฝ้าระวัง)");
+        }
+
+        // เคลียร์ Interval เก่าก่อนเริ่มใหม่
+        clearInterval(timerInterval);
+        
+        timerInterval = setInterval(() => {
+            secondsElapsed++;
+            let mins = Math.floor(secondsElapsed / 60).toString().padStart(2, '0');
+            let secs = (secondsElapsed % 60).toString().padStart(2, '0');
+            timerDisplay.innerText = `${mins}:${secs}`;
+
+            // เมื่อวัตถุกีดขวางเกินเวลาที่กำหนด และยังไม่มีการกดรับทราบ
+            if (secondsElapsed >= alertTimeoutSeconds && !isAcknowledged) {
+                clearInterval(timerInterval); 
+                triggerVoiceAlarm(); 
+            }
+        }, 1000);
+    }
+
+    // 6. ระบบส่งเสียงพูดแจ้งเตือนซ้ำเป็นระยะ (Looping Alarm)
+    function triggerVoiceAlarm() {
+        statusBanner.className = "status-danger";
+        let textToSpeak = "";
+
+        if (currentType === "vehicle") {
+            statusBanner.innerText = "🚨 อันตราย: รถจอดขวางเกินเวลา! 🚨";
+            textToSpeak = "คำเตือน มีรถยนต์จอดขวางทางเข้าออก กรุณาเคลื่อนย้ายรถด้วยค่ะ";
+            notifyOwner("🚨 รถจอดแช่เกินเวลา!", "มีรถมาจอดขวางทางเข้าออกเป็นเวลานานเกินกำหนด");
+        } else if (currentType === "obstacle") {
+            statusBanner.innerText = "🚨 อันตราย: สิ่งของกีดขวางทาง! 🚨";
+            textToSpeak = "แจ้งเตือน ตรวจพบสิ่งของกีดขวางบริเวณพื้นที่ทางเข้าออก กรุณาตรวจสอบค่ะ";
+            notifyOwner("📦 สิ่งของกีดขวางทาง!", "พบวัตถุถูกนำมาวางกีดขวางหน้าประตูทางเข้าออก");
+        }
+
+        addLog(`🤖 AI แจ้งเตือน: สั่งพูดออกลำโพง: "${textToSpeak}"`, true);
+        speakNotification(textToSpeak);
+        
+        clearInterval(voiceInterval);
+        voiceInterval = setInterval(() => {
+            if (!isAcknowledged) {
+                speakNotification(textToSpeak);
+            }
+        }, 6000);
+    }
+
+    // 7. ฟังก์ชันแปลภาษาเป็นคำพูดส่งออกลำโพง
+    function speakNotification(text) {
+        if ('speechSynthesis' in window) {
+            window.speechSynthesis.cancel(); 
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'th-TH';
+            window.speechSynthesis.speak(utterance);
+        }
+    }
+
+    // 8. ฟังก์ชันลงบันทึกประวัติ (Log) และ Push แจ้งเตือนหน้าจอ
+    function addLog(message, isAlert = false) {
+        const now = new Date().toLocaleTimeString();
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+        if (isAlert) entry.style.borderLeftColor = '#c62828';
+        entry.innerText = `[${now}] ${message}`;
+        logBox.appendChild(entry);
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function notifyOwner(title, message) {
+        if (Notification.permission === "granted") {
+            new Notification(title, { body: message });
+        }
+        addLog(`📲 [LINE / PUSH] ยิงสัญญาณแจ้งเตือนไปที่มือถือเรียบร้อย`);
+    }
+
+    // 9. ปุ่ม "รับทราบ": หยุดเสียงเตือน แต่รักษาสถานะค้างไว้ไม่ให้ระบบนับ 0 ใหม่ทันทีจนกว่าวัตถุจะออกไปจริง
+    function acknowledgeAlert() {
+        if (statusBanner.className === "status-clear") return;
+
+        isAcknowledged = true;
+        clearInterval(voiceInterval); 
+        window.speechSynthesis.cancel(); 
+        
+        statusBanner.className = "status-acknowledged";
+        statusBanner.innerText = "✅ เจ้าของรับทราบแล้ว (ปิดเสียงเตือนชั่วคราว)";
+        addLog("🔔 เจ้าของบ้านกดปุ่ม [รับทราบ] - ปิดระบบเสียงเตือนภัยชั่วคราว");
+    }
+
+    // 10. รีเซ็ตระบบอัตโนมัติเมื่อวัตถุเคลื่อนย้ายออกไปแล้ว
+    function autoResetToClear() {
+        clearInterval(timerInterval);
+        clearInterval(voiceInterval);
+        window.speechSynthesis.cancel();
+        secondsElapsed = 0;
+        currentType = "";
+        isAcknowledged = false;
+        timerDisplay.innerText = "00:00";
+        timerTitle.innerText = "เวลาที่เริ่มตรวจจับ";
+        statusBanner.className = "status-clear";
+        statusBanner.innerText = "สถานะ: ปกติ - พื้นที่ว่างไม่มีสิ่งกีดขวาง";
+        addLog("🔄 AI ตรวจพบวัตถุย้ายออกไปแล้ว - รีเซ็ตระบบกลับสู่โหมดเฝ้าระวังปกติ");
+    }
+
+    // 11. ปุ่มเคลียร์ระบบแบบ Manual
+    function resetSystem() {
+        autoResetToClear();
+        addLog("🔄 เจ้าของบ้านสั่งรีเซ็ตระบบด้วยตัวเอง");
+    }
+</script>
+
+</body>
+</html>
