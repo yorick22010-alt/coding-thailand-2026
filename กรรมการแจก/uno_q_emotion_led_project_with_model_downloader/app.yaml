@@ -1,0 +1,6 @@
+name: UNO Q Emotion LED Matrix
+icon: 😊
+description: Browser AI detects face emotion and sends the result to the UNO Q LED matrix.
+
+bricks:
+  - arduino:web_ui: {}

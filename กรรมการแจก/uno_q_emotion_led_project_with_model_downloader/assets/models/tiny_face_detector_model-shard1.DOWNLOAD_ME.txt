@@ -1,0 +1,6 @@
+DOWNLOAD THIS FILE HERE
+
+Destination: assets/models/tiny_face_detector_model-shard1.DOWNLOAD_ME.txt
+URL: https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights/tiny_face_detector_model-shard1
+
+Run scripts/download_assets.py to download all required files automatically.

@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+
+    <!--
+        This title appears on the browser tab.
+    -->
+    <title>UNO Q Dimmer Web Page</title>
+
+    <style>
+        /*
+            The body is the whole visible webpage.
+
+            We use a light gray background to make the white control panel
+            easy to see.
+        */
+        body {
+            background: #f3f4f6;
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 40px;
+        }
+
+        /*
+            This is the main white box that contains everything:
+            title, mode buttons, lamp, slider, and status text.
+        */
+        .panel {
+            background: white;
+            width: 420px;
+            margin: auto;
+            padding: 30px;
+            border-radius: 20px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+        }
+
+        /*
+            Main title of the web page.
+        */
+        h1 {
+            margin-top: 0;
+            color: #222;
+        }
+
+        /*
+            Small subtitle under the main title.
+        */
+        .subtitle {
+            color: #666;
+            font-size: 15px;
+            margin-bottom: 25px;
+        }
+
+        /*
+            This section contains the WEB and POT mode buttons.
+        */
+        .mode-area {
+            margin-bottom: 25px;
+        }
+
+        /*
+            General button design.
+        */
+        button {
+            width: 130px;
+            padding: 12px;
+            margin: 5px;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        /*
+            Active mode button.
+        */
+        .active-mode {
+            background: #2563eb;
+            color: white;
+        }
+
+        /*
+            Inactive mode button.
+        */
+        .inactive-mode {
+            background: #e5e7eb;
+            color: #333;
+        }
+
+        /*
+            The blue lamp is a webpage preview of the real LED.
+        */
+        .lamp {
+            width: 180px;
+            height: 180px;
+            margin: 25px auto;
+            border-radius: 50%;
+            background: rgb(255, 140, 0);
+            border: 5px solid #444;
+            opacity: 0.6;
+            box-shadow: 0 0 25px rgba(255, 40, 0, 0.8);
+            transition: opacity 0.2s, box-shadow 0.2s;
+        }
+
+        /*
+            Text above the brightness slider.
+        */
+        .slider-label {
+            font-size: 17px;
+            font-weight: bold;
+            color: #333;
+            margin-top: 15px;
+        }
+
+        /*
+            Slider design.
+        */
+        input[type="range"] {
+            width: 300px;
+            margin-top: 15px;
+        }
+
+        /*
+            Disabled slider design.
+
+            In POT mode, the slider is disabled because the potentiometer
+            controls the dimmer.
+        */
+        input[type="range"]:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+
+        /*
+            Status text below the slider.
+        */
+        .status {
+            margin-top: 15px;
+            font-size: 17px;
+            color: #333;
+        }
+
+        /*
+            Short explanation text.
+        */
+        .note {
+            margin-top: 25px;
+            font-size: 14px;
+            color: #666;
+            line-height: 1.5;
+        }
+
+        /*
+            Connection status.
+        */
+        .connection {
+            margin-top: 18px;
+            font-size: 13px;
+            color: #777;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!--
+        Main control panel.
+    -->
+    <div class="panel">
+
+        <!--
+            Web page title.
+        -->
+        <h1>UNO Q Dimmer</h1>
+
+        <div class="subtitle">
+            Web Mode and Potentiometer Mode
+        </div>
+
+        <!--
+            Mode selection buttons.
+
+            These buttons do not directly control the MCU.
+            They send Socket.IO messages to Python.
+        -->
+        <div class="mode-area">
+            <button id="webModeBtn" class="active-mode">WEB Mode</button>
+            <button id="potModeBtn" class="inactive-mode">POT Mode</button>
+        </div>
+
+        <!--
+            Webpage lamp preview.
+
+            The real LED is controlled by the MCU.
+            This lamp only shows the current brightness visually.
+        -->
+        <div id="lamp" class="lamp"></div>
+
+        <!--
+            Slider section.
+        -->
+        <div class="slider-label">
+            Brightness Control
+        </div>
+
+        <!--
+            Brightness slider.
+
+            In WEB mode:
+                enabled
+
+            In POT mode:
+                disabled
+        -->
+        <input id="brightnessSlider" type="range" min="0" max="100" value="50">
+
+        <!--
+            Brightness command from the web slider.
+        -->
+        <div class="status">
+            Web Brightness: <span id="brightnessText">50</span>%
+        </div>
+
+        <!--
+            Current mode selected from WebUI.
+        -->
+        <div class="status">
+            Current Mode: <span id="modeText">WEB</span>
+        </div>
+
+        <!--
+            Actual brightness sent to the real LED.
+        -->
+        <div class="status">
+            Output to LED: <span id="outputText">50</span>%
+        </div>
+
+        <!--
+            Potentiometer value, useful in POT mode.
+        -->
+        <div class="status">
+            Potentiometer: <span id="potText">0</span>%
+        </div>
+
+        <div class="note">
+            In WEB mode, the slider sends brightness to Python using Socket.IO.<br>
+            In POT mode, the slider is disabled and Python reads the potentiometer through Bridge.
+        </div>
+
+        <div class="connection">
+            Socket.IO status: <span id="socketStatus">Disconnected</span>
+        </div>
+
+    </div>
+
+    <!--
+        Load local Socket.IO client library.
+
+        Put the file here:
+            assets/libs/socket.io.min.js
+
+        This keeps the project self-contained and consistent.
+    -->
+    <script src="libs/socket.io.min.js"></script>
+
+    <script>
+        /*
+            =====================================================
+            JavaScript Part
+            =====================================================
+
+            This script connects the webpage to Python using Socket.IO.
+
+            Browser:
+                button click / slider movement
+
+            JavaScript:
+                socket.emit(...)
+
+            Python:
+                ui.on_message(...)
+
+            Python to MCU:
+                Bridge.call(...)
+
+            MCU:
+                analogRead() and analogWrite()
+        */
+
+        /*
+            Connect to the Socket.IO server provided by WebUI.
+        */
+        const socket = io();
+
+        /*
+            Get HTML elements by id.
+        */
+        const webModeBtn = document.getElementById("webModeBtn");
+        const potModeBtn = document.getElementById("potModeBtn");
+        const slider = document.getElementById("brightnessSlider");
+        const lamp = document.getElementById("lamp");
+
+        const brightnessText = document.getElementById("brightnessText");
+        const modeText = document.getElementById("modeText");
+        const outputText = document.getElementById("outputText");
+        const potText = document.getElementById("potText");
+        const socketStatus = document.getElementById("socketStatus");
+
+
+        /*
+            updateLamp(brightness)
+
+            This changes only the webpage lamp preview.
+
+            brightness:
+                number from 0 to 100
+        */
+        function updateLamp(brightness) {
+            const opacityValue = 0.15 + (brightness / 100) * 0.85;
+            const glowSize = brightness * 0.5;
+
+            lamp.style.opacity = opacityValue;
+            lamp.style.boxShadow =
+                "0 0 " + glowSize + "px rgba(255, 140, 0, 0.9)";
+        }
+
+
+        /*
+            applyState(data)
+
+            This function receives the system state from Python
+            and updates the whole webpage.
+        */
+        function applyState(data) {
+            /*
+                Update text values.
+            */
+            modeText.textContent = data.mode;
+            brightnessText.textContent = data.web_brightness;
+            outputText.textContent = data.output_brightness;
+            potText.textContent = data.pot_brightness;
+
+            /*
+                Update the slider value.
+                In WEB mode, it shows the web command.
+                In POT mode, it still remembers the last web command,
+                but the slider is disabled.
+            */
+            slider.value = data.web_brightness;
+
+            /*
+                Update the webpage lamp preview using the actual LED output.
+            */
+            updateLamp(data.output_brightness);
+
+            /*
+                Enable or disable the slider according to the mode.
+            */
+            slider.disabled = !data.slider_enabled;
+
+            /*
+                Update button colors.
+            */
+            if (data.mode === "WEB") {
+                webModeBtn.className = "active-mode";
+                potModeBtn.className = "inactive-mode";
+            } else {
+                webModeBtn.className = "inactive-mode";
+                potModeBtn.className = "active-mode";
+            }
+        }
+
+
+        /*
+            Socket.IO connection event.
+
+            This runs when the browser connects to Python.
+        */
+        socket.on("connect", function () {
+            socketStatus.textContent = "Connected";
+
+            /*
+                Ask Python for the latest state when the browser connects.
+            */
+            socket.emit("get_state", {});
+        });
+
+
+        /*
+            Socket.IO disconnect event.
+
+            This runs when the browser loses connection to Python.
+        */
+        socket.on("disconnect", function () {
+            socketStatus.textContent = "Disconnected";
+        });
+
+
+        /*
+            Receive state update from Python.
+
+            Python sends this event using:
+                ui.send_message("state_update", message=state)
+        */
+        socket.on("state_update", function (data) {
+            applyState(data);
+        });
+
+
+        /*
+            WEB Mode button event.
+
+            When clicked:
+                send mode command to Python.
+        */
+        webModeBtn.addEventListener("click", function () {
+            socket.emit("set_mode", {
+                mode: "WEB"
+            });
+        });
+
+
+        /*
+            POT Mode button event.
+
+            When clicked:
+                send mode command to Python.
+        */
+        potModeBtn.addEventListener("click", function () {
+            socket.emit("set_mode", {
+                mode: "POT"
+            });
+        });
+
+
+        /*
+            Slider input event.
+
+            When the slider moves:
+                1. Read slider value.
+                2. Update local lamp immediately for smooth feeling.
+                3. Send brightness command to Python.
+
+            Python will decide whether this value controls the real LED.
+            In POT mode, Python stores the value but does not use it
+            to drive the LED.
+        */
+        slider.addEventListener("input", function () {
+            const brightness = Number(slider.value);
+
+            /*
+                Update webpage immediately.
+            */
+            brightnessText.textContent = brightness;
+            updateLamp(brightness);
+
+            /*
+                Send brightness to Python.
+            */
+            socket.emit("set_brightness", {
+                brightness: brightness
+            });
+        });
+
+
+        /*
+            Ask Python for state when the page first loads.
+
+            This is a safety call in case the connect event happens early.
+        */
+        socket.emit("get_state", {});
+    </script>
+
+</body>
+</html>
